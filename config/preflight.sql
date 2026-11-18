@@ -43,6 +43,20 @@ BEGIN
           AND (
               control.relowner <> owner_oid OR control.relkind <> 'r'
               OR EXISTS (
+                  SELECT 1
+                  FROM aclexplode(control.relacl) AS privilege
+                  WHERE privilege.grantee <> owner_oid
+              )
+              OR EXISTS (
+                  SELECT 1
+                  FROM pg_attribute AS attribute
+                  CROSS JOIN LATERAL aclexplode(attribute.attacl) AS privilege
+                  WHERE attribute.attrelid = control.oid
+                    AND attribute.attnum > 0
+                    AND NOT attribute.attisdropped
+                    AND privilege.grantee <> owner_oid
+              )
+              OR EXISTS (
                   SELECT 1 FROM pg_roles AS runtime
                   WHERE runtime.rolname IN ('scrapbook_app', 'scrapbook_audit_reader')
                     AND (

@@ -27,7 +27,7 @@ AS $signature$
         FROM pg_namespace WHERE nspname = 'scrapbook'
         UNION ALL
         SELECT jsonb_build_array('relation', relname, relkind, pg_get_userbyid(relowner), relacl::text,
-            relrowsecurity, relforcerowsecurity, relispartition,
+            relpersistence, relrowsecurity, relforcerowsecurity, relispartition,
             CASE WHEN relkind IN ('i', 'I') THEN pg_get_indexdef(oid) END)
         FROM relations
         UNION ALL

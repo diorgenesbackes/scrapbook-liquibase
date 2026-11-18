@@ -116,6 +116,8 @@ class BaselineTests(unittest.TestCase):
         self.assertEqual("180006", checked(self.psql("SHOW server_version_num")))
         self.assertEqual("scrapbook_owner", checked(self.psql("SELECT current_user", user=MIGRATOR)))
         checked(self.liquibase("validate"))
+        self.assertIn("CREATE TABLE scrapbook.accounts", checked(self.liquibase("update-sql")))
+        self.assertEqual(set(), self.installed_tables())
         self.install()
         self.assertEqual(TABLES, self.installed_tables())
         self.assert_history(1)
@@ -168,6 +170,26 @@ class BaselineTests(unittest.TestCase):
             AND table_name = 'accounts';
         """)))
 
+    def test_install_rejects_prior_liquibase_history(self):
+        with tempfile.TemporaryDirectory(prefix="scrapbook-f01-prior-history-") as temp:
+            filename = "fixture-prior.yaml"
+            (Path(temp) / filename).write_text("""
+databaseChangeLog:
+  - changeSet:
+      id: fixture-prior
+      author: fixture
+      changes:
+        - sql:
+            sql: SELECT 1;
+""")
+            checked(self.liquibase("update", f"--changelog-file={filename}", cwd=temp))
+        history_query = "SELECT id, author, filename, orderexecuted, exectype FROM scrapbook.databasechangelog"
+        original_history = checked(self.psql(history_query))
+        self.assertEqual("fixture-prior|fixture|fixture-prior.yaml|1|EXECUTED", original_history)
+        checked(self.liquibase("update"), expected="divergência no catálogo")
+        self.assertEqual(set(), self.installed_tables())
+        self.assertEqual(original_history, checked(self.psql(history_query)))
+
     def test_bootstrap_rejects_unexpected_role_membership(self):
         checked(self.psql("GRANT pg_read_all_data TO scrapbook_app WITH SET TRUE"))
         try:
@@ -206,6 +228,27 @@ class BaselineTests(unittest.TestCase):
         checked(self.liquibase("update"), expected="Privilégios efetivos incompatíveis nos controles do Liquibase")
         self.assertEqual(TABLES, self.installed_tables())
         self.assert_history(1)
+
+    def test_reapply_rejects_control_grants_outside_matrix(self):
+        role = "fixture_liquibase_reader"
+        checked(self.psql(f"CREATE ROLE {role} NOLOGIN; GRANT USAGE ON SCHEMA scrapbook TO {role}"))
+        try:
+            self.install()
+            for grant in (
+                "SELECT ON scrapbook.databasechangelog",
+                "UPDATE (locked) ON scrapbook.databasechangeloglock",
+            ):
+                with self.subTest(grant=grant):
+                    checked(self.psql(f"GRANT {grant} TO {role}"))
+                    checked(self.liquibase("update"),
+                            expected="Privilégios efetivos incompatíveis nos controles do Liquibase")
+                    checked(self.psql(f"REVOKE {grant} FROM {role}"))
+                    self.assertEqual(TABLES, self.installed_tables())
+                    self.assert_history(1)
+            self.install()
+            self.assert_history(1)
+        finally:
+            checked(self.psql(f"DROP OWNED BY {role}; DROP ROLE {role}"))
 
     def test_application_permissions_and_audit(self):
         self.install()
@@ -363,6 +406,21 @@ class BaselineTests(unittest.TestCase):
         checked(self.liquibase("update"), expected="divergência no catálogo")
         checked(self.liquibase("rollback-count", "--count=1"), expected="catálogo")
         self.assertEqual(TABLES, self.installed_tables())
+        self.assert_history(1)
+
+    def test_audit_persistence_drift_blocks_update_and_rollback(self):
+        self.install()
+        signature_query = "SELECT scrapbook.foundation_signature()"
+        original_signature = checked(self.psql(signature_query))
+        checked(self.psql("ALTER TABLE scrapbook.audit_entries SET UNLOGGED"))
+        self.assertNotEqual(original_signature, checked(self.psql(signature_query)))
+        checked(self.liquibase("update"), expected="divergência no catálogo")
+        checked(self.liquibase("rollback-count", "--count=1"), expected="catálogo")
+        self.assertEqual(TABLES, self.installed_tables())
+        self.assert_history(1)
+        checked(self.psql("ALTER TABLE scrapbook.audit_entries SET LOGGED"))
+        self.assertEqual(original_signature, checked(self.psql(signature_query)))
+        self.install()
         self.assert_history(1)
 
     def test_rollback_and_reapply_empty_baseline(self):

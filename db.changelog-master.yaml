@@ -22,6 +22,9 @@ databaseChangeLog:
                       changeLogFile: changelogs/sprint-1/changelog.yaml
               - sqlCheck:
                   expectedResult: "0"
+                  sql: SELECT count(*) FROM scrapbook.databasechangelog
+              - sqlCheck:
+                  expectedResult: "0"
                   sql: |
                     SELECT
                         (SELECT count(*) FROM pg_class AS c
