@@ -4,7 +4,7 @@ O changelog inicial da F01 instala as 24 tabelas de aplicação no schema `scrap
 
 ## Estrutura e acesso
 
-- [config/bootstrap.sql](config/bootstrap.sql) prepara o schema e as roles. O operador executa esse passo administrativo no banco novo, antes da primeira conexão do Liquibase. Configure credenciais de login por mecanismo privado.
+- [config/bootstrap.sql](config/bootstrap.sql) prepara o schema e as roles. O operador executa esse passo administrativo no banco novo, antes da primeira conexão do Liquibase. Configure credenciais de login por mecanismo privado. O preparo recusa associações de roles e privilégios padrão incompatíveis, inclusive defaults no schema ou para PUBLIC.
 - `scrapbook_owner` é a proprietária sem login. `scrapbook_migrator` autentica separadamente e assume a proprietária no banco provisionado. As tabelas de controle usam o schema `scrapbook`.
 - `scrapbook_app` tem USAGE no schema, leitura e inserção nas tabelas de aplicação comuns e UPDATE nas tabelas mutáveis. A auditoria permite somente INSERT à aplicação. A leitura de auditoria usa a role separada `scrapbook_audit_reader`. O controle do Liquibase é restrito à proprietária e à sessão de migração.
 - [db.changelog-master.yaml](db.changelog-master.yaml) inclui uma migração transacional. Os arquivos SQL criam tabelas e índices, adicionam as FKs depois das chaves candidatas, aplicam privilégios e registram uma assinatura do catálogo.
@@ -21,6 +21,12 @@ liquibase --liquibase-schema-name=scrapbook status --changelog-file=db.changelog
 ```
 
 A reaplicação verifica o estado conhecido do catálogo e preserva o histórico. Em base nova, objetos preexistentes precisam de transição explícita. Revisar o alvo, ownership, histórico e catálogo quando o Liquibase recusar o estado.
+
+## Evoluir o catálogo
+
+Cada changeset que altera o catálogo deve terminar com `SELECT scrapbook.checkpoint_catalog('id-anterior', 'id-do-changeset')` na mesma transação do DDL. Use os IDs registrados pelo autor `scrapbook`. A função confirma a geração anterior e valida os privilégios efetivos de runtime sobre a auditoria e os controles do Liquibase. O `update` compara a assinatura com a definição do catálogo e verifica se a geração consta no histórico.
+
+No rollback de uma evolução, confira primeiro se a geração e a assinatura correspondem ao changeset que será revertido. Desfaça o DDL e chame `scrapbook.checkpoint_catalog('id-do-changeset', 'id-anterior')` na mesma transação. A assinatura cobre os parâmetros de definição das sequências `IDENTITY`, como incremento e limites. O avanço normal da sequência na inserção é independente dessa comparação.
 
 ## Reverter no laboratório
 

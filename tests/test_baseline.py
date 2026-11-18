@@ -163,6 +163,41 @@ class BaselineTests(unittest.TestCase):
             AND table_name = 'accounts';
         """)))
 
+    def test_bootstrap_rejects_unexpected_role_membership(self):
+        checked(self.psql("GRANT pg_read_all_data TO scrapbook_app WITH SET TRUE"))
+        try:
+            bootstrap = (ROOT / "config/bootstrap.sql").read_text()
+            checked(self.psql(bootstrap), expected="Associação de roles incompatível")
+            self.assertEqual(set(), self.installed_tables())
+        finally:
+            checked(self.psql("REVOKE pg_read_all_data FROM scrapbook_app"))
+
+    def test_bootstrap_rejects_global_and_schema_default_grants(self):
+        bootstrap = (ROOT / "config/bootstrap.sql").read_text()
+        for scope in ("", " IN SCHEMA scrapbook"):
+            with self.subTest(scope=scope):
+                alter = f"ALTER DEFAULT PRIVILEGES FOR ROLE scrapbook_owner{scope}"
+                checked(self.psql(alter + " GRANT SELECT ON TABLES TO PUBLIC"))
+                checked(self.psql(bootstrap), expected="Privilégios padrão incompatíveis")
+                checked(self.psql(alter + " REVOKE SELECT ON TABLES FROM PUBLIC"))
+        checked(self.psql(bootstrap))
+
+    def test_install_rejects_effective_audit_access_after_bootstrap(self):
+        checked(self.psql("""
+            ALTER DEFAULT PRIVILEGES FOR ROLE scrapbook_owner IN SCHEMA scrapbook
+            GRANT SELECT ON TABLES TO scrapbook_app;
+        """))
+        checked(self.liquibase("update"), expected="Privilégios efetivos incompatíveis")
+        self.assertEqual(set(), self.installed_tables())
+        self.assert_history(0)
+
+    def test_reapply_rejects_effective_read_on_liquibase_control(self):
+        self.install()
+        checked(self.psql("GRANT SELECT (id) ON scrapbook.databasechangelog TO scrapbook_app"))
+        checked(self.liquibase("update"), expected="divergência no catálogo")
+        self.assertEqual(TABLES, self.installed_tables())
+        self.assert_history(1)
+
     def test_application_permissions_and_audit(self):
         self.install()
         self.assertEqual("1", checked(self.psql(
@@ -195,6 +230,8 @@ class BaselineTests(unittest.TestCase):
                 has_table_privilege('scrapbook_audit_reader', 'scrapbook.audit_entries', 'DELETE'),
                 has_table_privilege('scrapbook_audit_reader', 'scrapbook.accounts', 'SELECT');
         """)))
+        self.install()
+        self.assert_history(1)
 
     def test_shared_technical_uniqueness(self):
         self.install()
@@ -236,6 +273,56 @@ class BaselineTests(unittest.TestCase):
         self.assertEqual(TABLES, self.installed_tables())
         self.assert_history(1)
         self.install()
+
+    def test_schema_generation_can_be_reapplied_and_reverted(self):
+        self.install()
+        initial_signature = checked(self.psql("SELECT scrapbook.foundation_signature()"))
+        with tempfile.TemporaryDirectory(prefix="scrapbook-f01-evolution-") as temp:
+            work = Path(temp)
+            shutil.copytree(ROOT / "changelogs", work / "changelogs")
+            original = (ROOT / "db.changelog-master.yaml").read_text()
+            (work / "db.changelog-master.yaml").write_text(original + """
+  - changeSet:
+      id: fixture-schema-generation
+      author: scrapbook
+      runInTransaction: true
+      changes:
+        - sql:
+            sql: ALTER TABLE scrapbook.accounts ADD COLUMN fixture_column text;
+        - sql:
+            sql: SELECT scrapbook.checkpoint_catalog('f01-story-001-base', 'fixture-schema-generation');
+      rollback:
+        - sql:
+            splitStatements: false
+            sql: |
+              DO $verify$
+              BEGIN
+                  IF obj_description('scrapbook.foundation_signature()'::regprocedure::oid, 'pg_proc')
+                      IS DISTINCT FROM 'fixture-schema-generation:' || scrapbook.foundation_signature() THEN
+                      RAISE EXCEPTION 'Catálogo incompatível com a reversão da fixture.';
+                  END IF;
+              END;
+              $verify$;
+              ALTER TABLE scrapbook.accounts DROP COLUMN fixture_column RESTRICT;
+              SELECT scrapbook.checkpoint_catalog('fixture-schema-generation', 'f01-story-001-base');
+""")
+            checked(self.liquibase("update", cwd=work))
+            self.assert_history(2)
+            checked(self.liquibase("update", cwd=work))
+            self.assert_history(2)
+            checked(self.liquibase("rollback-count", "--count=1", cwd=work))
+            self.assert_history(1)
+        self.assertEqual(initial_signature, checked(self.psql("SELECT scrapbook.foundation_signature()")))
+        self.install()
+        self.assert_history(1)
+
+    def test_sequence_definition_drift_blocks_update_and_rollback(self):
+        self.install()
+        checked(self.psql("ALTER SEQUENCE scrapbook.accounts_id_seq INCREMENT BY 10"))
+        checked(self.liquibase("update"), expected="divergência no catálogo")
+        checked(self.liquibase("rollback-count", "--count=1"), expected="catálogo")
+        self.assertEqual(TABLES, self.installed_tables())
+        self.assert_history(1)
 
     def test_rollback_and_reapply_empty_baseline(self):
         self.install()

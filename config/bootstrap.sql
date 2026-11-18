@@ -33,9 +33,16 @@ BEGIN
     END LOOP;
 
     SELECT oid INTO STRICT owner_oid FROM pg_roles WHERE rolname = 'scrapbook_owner';
-    IF pg_has_role('scrapbook_app', 'scrapbook_owner', 'MEMBER')
-        OR pg_has_role('scrapbook_audit_reader', 'scrapbook_owner', 'MEMBER') THEN
-        RAISE EXCEPTION 'Identidade de runtime ou auditoria possui vínculo indevido com a proprietária.';
+    IF EXISTS (
+        SELECT 1 FROM pg_auth_members AS membership
+        JOIN pg_roles AS member ON member.oid = membership.member
+        WHERE member.rolname IN ('scrapbook_owner', 'scrapbook_app', 'scrapbook_audit_reader', 'scrapbook_migrator')
+          AND NOT (
+              member.rolname = 'scrapbook_migrator' AND membership.roleid = owner_oid
+              AND NOT membership.admin_option AND NOT membership.inherit_option AND membership.set_option
+          )
+    ) THEN
+        RAISE EXCEPTION 'Associação de roles incompatível com a matriz Scrap Book.';
     END IF;
 
     IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'scrapbook') THEN
@@ -50,6 +57,17 @@ BEGIN
     REVOKE ALL ON SCHEMA scrapbook FROM PUBLIC;
     GRANT USAGE ON SCHEMA scrapbook TO scrapbook_app, scrapbook_audit_reader;
     ALTER DEFAULT PRIVILEGES FOR ROLE scrapbook_owner REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+
+    IF EXISTS (
+        SELECT 1 FROM pg_default_acl AS defaults
+        CROSS JOIN LATERAL aclexplode(defaults.defaclacl) AS privilege
+        WHERE defaults.defaclrole = owner_oid
+          AND defaults.defaclnamespace IN (0, 'scrapbook'::regnamespace)
+          AND defaults.defaclobjtype IN ('r', 'S', 'f')
+          AND privilege.grantee <> owner_oid
+    ) THEN
+        RAISE EXCEPTION 'Privilégios padrão incompatíveis com a matriz Scrap Book.';
+    END IF;
 
     EXECUTE format('ALTER ROLE scrapbook_migrator IN DATABASE %I SET role = scrapbook_owner',
         database_name);

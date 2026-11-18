@@ -31,10 +31,12 @@ DO $rollback$
 DECLARE
     table_name text;
     has_data boolean;
+    catalog_hash text := scrapbook.foundation_signature();
 BEGIN
     IF current_user <> 'scrapbook_owner'
+        OR catalog_hash IS NULL
         OR obj_description('scrapbook.foundation_signature()'::regprocedure::oid, 'pg_proc')
-            IS DISTINCT FROM 'f01-baseline:' || scrapbook.foundation_signature() THEN
+            IS DISTINCT FROM 'f01-story-001-base:' || catalog_hash THEN
         RAISE EXCEPTION 'Rollback recusado: catálogo ou proveniência incompatível.';
     END IF;
 
@@ -77,4 +79,5 @@ DROP TABLE
     scrapbook.accounts
 RESTRICT;
 
+DROP FUNCTION scrapbook.checkpoint_catalog(text, text) RESTRICT;
 DROP FUNCTION scrapbook.foundation_signature() RESTRICT;
