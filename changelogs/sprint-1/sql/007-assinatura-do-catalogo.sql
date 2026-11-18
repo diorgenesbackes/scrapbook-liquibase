@@ -31,7 +31,8 @@ AS $signature$
             CASE WHEN relkind IN ('i', 'I') THEN pg_get_indexdef(oid) END)
         FROM relations
         UNION ALL
-        SELECT jsonb_build_array('column', r.relname, a.attnum, a.attname,
+        SELECT jsonb_build_array('column', r.relname,
+            row_number() OVER (PARTITION BY r.oid ORDER BY a.attnum), a.attname,
             format_type(a.atttypid, a.atttypmod), a.attnotnull, a.attidentity,
             a.attgenerated, a.attacl::text, pg_get_expr(d.adbin, d.adrelid))
         FROM relations AS r
@@ -79,18 +80,26 @@ AS $signature$
     );
 $signature$;
 
-CREATE FUNCTION scrapbook.checkpoint_catalog(expected_generation text, next_generation text) RETURNS void
+CREATE FUNCTION scrapbook.checkpoint_catalog(expected_generation text, next_generation text, restoring boolean DEFAULT FALSE)
+RETURNS void
 LANGUAGE plpgsql
 SET search_path TO pg_catalog
 AS $checkpoint$
 DECLARE
-    previous_checkpoint text := obj_description('scrapbook.foundation_signature()'::regprocedure::oid, 'pg_proc');
+    checkpoint jsonb := COALESCE(
+        obj_description('scrapbook.foundation_signature()'::regprocedure::oid, 'pg_proc')::jsonb,
+        '{"signatures": {}}'::jsonb
+    );
     catalog_hash text := scrapbook.foundation_signature();
+    known_hash text := checkpoint->'signatures'->>next_generation;
 BEGIN
     IF current_user <> 'scrapbook_owner'
         OR next_generation IS NULL OR next_generation !~ '^[a-z0-9][a-z0-9-]*$'
+        OR restoring IS NULL
         OR expected_generation IS NOT DISTINCT FROM next_generation
-        OR split_part(previous_checkpoint, ':', 1) IS DISTINCT FROM expected_generation THEN
+        OR checkpoint->>'generation' IS DISTINCT FROM expected_generation
+        OR jsonb_typeof(checkpoint->'signatures') IS DISTINCT FROM 'object'
+        OR (expected_generation IS NOT NULL AND checkpoint->'signatures'->>expected_generation IS NULL) THEN
         RAISE EXCEPTION 'Transição de geração do catálogo incompatível.';
     END IF;
 
@@ -98,9 +107,22 @@ BEGIN
         RAISE EXCEPTION 'Privilégios efetivos incompatíveis com a matriz Scrap Book.';
     END IF;
 
+    IF restoring AND known_hash IS NULL THEN
+        RAISE EXCEPTION 'Assinatura da geração de destino indisponível.';
+    END IF;
+
+    IF known_hash IS NOT NULL AND known_hash <> catalog_hash THEN
+        RAISE EXCEPTION 'Catálogo incompatível com a assinatura registrada da geração %.', next_generation;
+    END IF;
+
+    IF known_hash IS NULL THEN
+        checkpoint := jsonb_set(checkpoint, ARRAY['signatures', next_generation], to_jsonb(catalog_hash));
+    END IF;
+    checkpoint := jsonb_set(checkpoint, '{generation}', to_jsonb(next_generation));
+
     EXECUTE format(
         'COMMENT ON FUNCTION scrapbook.foundation_signature() IS %L',
-        next_generation || ':' || catalog_hash
+        checkpoint::text
     );
 END;
 $checkpoint$;

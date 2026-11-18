@@ -7,30 +7,32 @@ O changelog inicial da F01 instala as 24 tabelas de aplicação no schema `scrap
 - [config/bootstrap.sql](config/bootstrap.sql) prepara o schema e as roles. O operador executa esse passo administrativo no banco novo, antes da primeira conexão do Liquibase. Configure credenciais de login por mecanismo privado. O preparo recusa associações de roles e privilégios padrão incompatíveis, inclusive defaults no schema ou para PUBLIC.
 - `scrapbook_owner` é a proprietária sem login. `scrapbook_migrator` autentica separadamente e assume a proprietária no banco provisionado. As tabelas de controle usam o schema `scrapbook`.
 - `scrapbook_app` tem USAGE no schema, leitura e inserção nas tabelas de aplicação comuns e UPDATE nas tabelas mutáveis. A auditoria permite somente INSERT à aplicação. A leitura de auditoria usa a role separada `scrapbook_audit_reader`. O controle do Liquibase é restrito à proprietária e à sessão de migração.
+- [scripts/migrate.py](scripts/migrate.py) verifica o alvo, os defaults e os controles preexistentes por JDBC antes de iniciar a CLI. A pré-validação usa uma conexão somente leitura e o JDK e driver PostgreSQL da instalação do Liquibase. Se a detecção por `liquibase --version` não informar os caminhos, forneça `JAVA_HOME` e `LIQUIBASE_HOME`.
 - [db.changelog-master.yaml](db.changelog-master.yaml) inclui uma migração transacional. Os arquivos SQL criam tabelas e índices, adicionam as FKs depois das chaves candidatas, aplicam privilégios e registram uma assinatura do catálogo.
 
 ## Aplicar em laboratório
 
-Em um PostgreSQL novo e descartável, configure o serviço de conexão administrativo e a configuração privada do Liquibase. Use a identidade migradora no Liquibase e preencha a URL JDBC do mesmo alvo preparado. Este fluxo é para o laboratório.
+Em um PostgreSQL novo e descartável, configure o serviço de conexão administrativo. Defina `LIQUIBASE_COMMAND_URL` com a URL JDBC sem credenciais e `LIQUIBASE_COMMAND_PASSWORD` com o segredo da identidade migradora, usando configuração privada. Mantenha o provisionamento de roles e os comandos de migração na mesma janela de operação, sem alterações concorrentes de privilégios.
 
 ```sh
 psql service=scrapbook_local_admin -X -v ON_ERROR_STOP=1 -f config/bootstrap.sql
-liquibase --liquibase-schema-name=scrapbook validate --changelog-file=db.changelog-master.yaml --default-schema-name=scrapbook
-liquibase --liquibase-schema-name=scrapbook update --changelog-file=db.changelog-master.yaml --default-schema-name=scrapbook
-liquibase --liquibase-schema-name=scrapbook status --changelog-file=db.changelog-master.yaml --default-schema-name=scrapbook
+python3 scripts/migrate.py validate
+python3 scripts/migrate.py update-sql
+python3 scripts/migrate.py update
+python3 scripts/migrate.py status
 ```
 
 A reaplicação verifica o estado conhecido do catálogo e preserva o histórico. Em base nova, objetos preexistentes precisam de transição explícita. Revisar o alvo, ownership, histórico e catálogo quando o Liquibase recusar o estado.
 
 ## Evoluir o catálogo
 
-Cada changeset que altera o catálogo deve terminar com `SELECT scrapbook.checkpoint_catalog('id-anterior', 'id-do-changeset')` na mesma transação do DDL. Use os IDs registrados pelo autor `scrapbook`. A função confirma a geração anterior e valida os privilégios efetivos de runtime sobre a auditoria e os controles do Liquibase. O `update` compara a assinatura com a definição do catálogo e verifica se a geração consta no histórico.
+Cada changeset que altera o catálogo deve terminar com `SELECT scrapbook.checkpoint_catalog('id-anterior', 'id-do-changeset')` na mesma transação do DDL. Use IDs de geração únicos e registrados pelo autor `scrapbook`. A função preserva a assinatura original de cada geração e confere os privilégios efetivos de runtime. O `update` valida o catálogo efetivo contra a assinatura da geração ativa e verifica se ela consta no histórico.
 
-No rollback de uma evolução, confira primeiro se a geração e a assinatura correspondem ao changeset que será revertido. Desfaça o DDL e chame `scrapbook.checkpoint_catalog('id-do-changeset', 'id-anterior')` na mesma transação. A assinatura cobre os parâmetros de definição das sequências `IDENTITY`, como incremento e limites. O avanço normal da sequência na inserção é independente dessa comparação.
+No rollback de uma evolução, confira primeiro se a geração e a assinatura correspondem ao changeset que será revertido. Desfaça o DDL e chame `scrapbook.checkpoint_catalog('id-do-changeset', 'id-anterior', TRUE)` na mesma transação. A chamada exige a assinatura histórica da geração de destino e recusa uma reversão incompleta. A assinatura cobre os parâmetros de definição das sequências `IDENTITY`, como incremento e limites. O avanço normal da sequência na inserção é independente dessa comparação.
 
 ## Reverter no laboratório
 
-Com o estado inicial como único changeset aplicado, a suíte usa `rollback-count --count=1` para exercitar a própria reversão. Conferir histórico e alvo antes de qualquer execução manual. O rollback bloqueia as tabelas durante a verificação, exige a assinatura esperada e recusa dados, objetos estranhos e dependências externas. O schema preparado, suas roles e as tabelas de controle permanecem após a reversão. Para homologação e produção, seguir o workflow manual de recuperação quando ele estiver disponível.
+Com o estado inicial como único changeset aplicado, a suíte usa `python3 scripts/migrate.py rollback-count --count=1` para exercitar a própria reversão. Conferir histórico e alvo antes de qualquer execução manual. O rollback bloqueia as tabelas durante a verificação, exige a assinatura esperada e recusa dados, objetos estranhos e dependências externas. O schema preparado, suas roles e as tabelas de controle permanecem após a reversão. Para homologação e produção, seguir o workflow manual de recuperação quando ele estiver disponível.
 
 ## Validar
 

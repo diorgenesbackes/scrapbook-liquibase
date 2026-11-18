@@ -41,13 +41,13 @@ databaseChangeLog:
                   expectedResult: "1"
                   sql: |
                     WITH checkpoint AS (
-                        SELECT obj_description('scrapbook.foundation_signature()'::regprocedure::oid, 'pg_proc') AS stamp
+                        SELECT obj_description('scrapbook.foundation_signature()'::regprocedure::oid, 'pg_proc')::jsonb AS state
                     )
                     SELECT count(*) FROM checkpoint
-                    WHERE split_part(stamp, ':', 2) = scrapbook.foundation_signature()
+                    WHERE state->'signatures'->>(state->>'generation') = scrapbook.foundation_signature()
                       AND EXISTS (
                           SELECT 1 FROM scrapbook.databasechangelog AS history
-                          WHERE history.id = split_part(stamp, ':', 1) AND history.author = 'scrapbook'
+                          WHERE history.id = state->>'generation' AND history.author = 'scrapbook'
                       )
   - include:
       file: changelogs/sprint-1/changelog.yaml

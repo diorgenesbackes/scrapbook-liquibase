@@ -1,9 +1,11 @@
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -63,6 +65,11 @@ class BaselineTests(unittest.TestCase):
         cli_version = checked(run(["liquibase", "--version"]))
         if f'Liquibase Version: {VERSIONS["liquibase"]}' not in cli_version:
             raise RuntimeError(f'Usar Liquibase {VERSIONS["liquibase"]} no laboratório.')
+        java = re.search(r"^Java Home (.+) \(Version ", cli_version, re.M)
+        liquibase = re.search(r"^Liquibase Home: (.+)$", cli_version, re.M)
+        if not java or not liquibase:
+            raise RuntimeError("Não foi possível localizar o JDK e a instalação do Liquibase.")
+        cls.runtime_env = {"JAVA_HOME": java.group(1), "LIQUIBASE_HOME": liquibase.group(1)}
 
     def setUp(self):
         type(self).counter += 1
@@ -88,11 +95,9 @@ class BaselineTests(unittest.TestCase):
 
     def liquibase(self, command, *args, cwd=ROOT):
         return run(
-            ["liquibase", "--log-level=warning", "--liquibase-schema-name=scrapbook", command,
-             "--changelog-file=db.changelog-master.yaml", "--default-schema-name=scrapbook",
-             f"--url=jdbc:postgresql://127.0.0.1:{self.port}/{self.database}",
-             f"--username={MIGRATOR}", *args],
-            cwd=cwd, env={"LIQUIBASE_COMMAND_PASSWORD": self.password},
+            [sys.executable, str(ROOT / "scripts/migrate.py"), command, *args], cwd=cwd,
+            env=self.runtime_env | {"LIQUIBASE_COMMAND_PASSWORD": self.password,
+                 "LIQUIBASE_COMMAND_URL": f"jdbc:postgresql://127.0.0.1:{self.port}/{self.database}"},
         )
 
     def installed_tables(self):
@@ -168,6 +173,7 @@ class BaselineTests(unittest.TestCase):
         try:
             bootstrap = (ROOT / "config/bootstrap.sql").read_text()
             checked(self.psql(bootstrap), expected="Associação de roles incompatível")
+            checked(self.liquibase("update"), expected="Associação de roles ou privilégios de runtime incompatíveis")
             self.assertEqual(set(), self.installed_tables())
         finally:
             checked(self.psql("REVOKE pg_read_all_data FROM scrapbook_app"))
@@ -182,19 +188,22 @@ class BaselineTests(unittest.TestCase):
                 checked(self.psql(alter + " REVOKE SELECT ON TABLES FROM PUBLIC"))
         checked(self.psql(bootstrap))
 
-    def test_install_rejects_effective_audit_access_after_bootstrap(self):
+    def test_install_rejects_unsafe_defaults_before_creating_controls(self):
         checked(self.psql("""
             ALTER DEFAULT PRIVILEGES FOR ROLE scrapbook_owner IN SCHEMA scrapbook
-            GRANT SELECT ON TABLES TO scrapbook_app;
+            GRANT SELECT, UPDATE ON TABLES TO scrapbook_app;
         """))
-        checked(self.liquibase("update"), expected="Privilégios efetivos incompatíveis")
+        checked(self.liquibase("update"), expected="Privilégios padrão incompatíveis")
         self.assertEqual(set(), self.installed_tables())
-        self.assert_history(0)
+        self.assertEqual("0", checked(self.psql("""
+            SELECT num_nonnulls(to_regclass('scrapbook.databasechangelog'),
+                to_regclass('scrapbook.databasechangeloglock'));
+        """)))
 
     def test_reapply_rejects_effective_read_on_liquibase_control(self):
         self.install()
         checked(self.psql("GRANT SELECT (id) ON scrapbook.databasechangelog TO scrapbook_app"))
-        checked(self.liquibase("update"), expected="divergência no catálogo")
+        checked(self.liquibase("update"), expected="Privilégios efetivos incompatíveis nos controles do Liquibase")
         self.assertEqual(TABLES, self.installed_tables())
         self.assert_history(1)
 
@@ -274,21 +283,17 @@ class BaselineTests(unittest.TestCase):
         self.assert_history(1)
         self.install()
 
-    def test_schema_generation_can_be_reapplied_and_reverted(self):
-        self.install()
-        initial_signature = checked(self.psql("SELECT scrapbook.foundation_signature()"))
-        with tempfile.TemporaryDirectory(prefix="scrapbook-f01-evolution-") as temp:
-            work = Path(temp)
-            shutil.copytree(ROOT / "changelogs", work / "changelogs")
-            original = (ROOT / "db.changelog-master.yaml").read_text()
-            (work / "db.changelog-master.yaml").write_text(original + """
+    def prepare_evolution(self, work, *, incomplete=False):
+        shutil.copytree(ROOT / "changelogs", work / "changelogs")
+        original = (ROOT / "db.changelog-master.yaml").read_text()
+        evolution = """
   - changeSet:
       id: fixture-schema-generation
       author: scrapbook
       runInTransaction: true
       changes:
         - sql:
-            sql: ALTER TABLE scrapbook.accounts ADD COLUMN fixture_column text;
+            sql: ALTER TABLE scrapbook.accounts ADD COLUMN fixture_first text, ADD COLUMN fixture_second text;
         - sql:
             sql: SELECT scrapbook.checkpoint_catalog('f01-story-001-base', 'fixture-schema-generation');
       rollback:
@@ -296,25 +301,61 @@ class BaselineTests(unittest.TestCase):
             splitStatements: false
             sql: |
               DO $verify$
+              DECLARE
+                  checkpoint jsonb := obj_description(
+                      'scrapbook.foundation_signature()'::regprocedure::oid, 'pg_proc'
+                  )::jsonb;
               BEGIN
-                  IF obj_description('scrapbook.foundation_signature()'::regprocedure::oid, 'pg_proc')
-                      IS DISTINCT FROM 'fixture-schema-generation:' || scrapbook.foundation_signature() THEN
+                  IF checkpoint->>'generation' IS DISTINCT FROM 'fixture-schema-generation'
+                      OR checkpoint->'signatures'->>'fixture-schema-generation'
+                          IS DISTINCT FROM scrapbook.foundation_signature() THEN
                       RAISE EXCEPTION 'Catálogo incompatível com a reversão da fixture.';
                   END IF;
               END;
               $verify$;
-              ALTER TABLE scrapbook.accounts DROP COLUMN fixture_column RESTRICT;
-              SELECT scrapbook.checkpoint_catalog('fixture-schema-generation', 'f01-story-001-base');
-""")
-            checked(self.liquibase("update", cwd=work))
-            self.assert_history(2)
-            checked(self.liquibase("update", cwd=work))
-            self.assert_history(2)
-            checked(self.liquibase("rollback-count", "--count=1", cwd=work))
-            self.assert_history(1)
-        self.assertEqual(initial_signature, checked(self.psql("SELECT scrapbook.foundation_signature()")))
+              ALTER TABLE scrapbook.accounts DROP COLUMN fixture_first, DROP COLUMN fixture_second RESTRICT;
+              SELECT scrapbook.checkpoint_catalog('fixture-schema-generation', 'f01-story-001-base', TRUE);
+"""
+        if incomplete:
+            evolution = evolution.replace(", DROP COLUMN fixture_second", "")
+        (work / "db.changelog-master.yaml").write_text(original + evolution)
+
+    def test_schema_generation_can_be_reapplied_and_reverted(self):
+        self.install()
+        initial_signature = checked(self.psql("SELECT scrapbook.foundation_signature()"))
+        with tempfile.TemporaryDirectory(prefix="scrapbook-f01-evolution-") as temp:
+            work = Path(temp)
+            self.prepare_evolution(work)
+            for _ in range(2):
+                checked(self.liquibase("update", cwd=work))
+                self.assert_history(2)
+                checked(self.liquibase("update", cwd=work))
+                self.assert_history(2)
+                checked(self.liquibase("rollback-count", "--count=1", cwd=work))
+                self.assert_history(1)
+                self.assertEqual(initial_signature, checked(self.psql("SELECT scrapbook.foundation_signature()")))
         self.install()
         self.assert_history(1)
+
+    def test_incomplete_rollback_preserves_active_generation_and_history(self):
+        self.install()
+        with tempfile.TemporaryDirectory(prefix="scrapbook-f01-partial-rollback-") as temp:
+            work = Path(temp)
+            self.prepare_evolution(work, incomplete=True)
+            checked(self.liquibase("update", cwd=work))
+            checkpoint = "SELECT obj_description('scrapbook.foundation_signature()'::regprocedure::oid, 'pg_proc')"
+            active = checked(self.psql(checkpoint))
+            checked(self.liquibase("rollback-count", "--count=1", cwd=work),
+                    expected="Catálogo incompatível com a assinatura registrada da geração f01-story-001-base")
+            self.assertEqual(active, checked(self.psql(checkpoint)))
+            self.assert_history(2)
+            self.assertEqual("2", checked(self.psql("""
+                SELECT count(*) FROM information_schema.columns
+                WHERE table_schema = 'scrapbook' AND table_name = 'accounts'
+                  AND column_name IN ('fixture_first', 'fixture_second');
+            """)))
+            checked(self.liquibase("update", cwd=work))
+            self.assert_history(2)
 
     def test_sequence_definition_drift_blocks_update_and_rollback(self):
         self.install()
