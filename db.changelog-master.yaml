@@ -1,0 +1,47 @@
+databaseChangeLog:
+  - preConditions:
+      - onFail: HALT
+      - onError: HALT
+      - onFailMessage: "Destino incompatível ou divergência no catálogo do schema scrapbook."
+      - dbms:
+          type: postgresql
+      - sqlCheck:
+          expectedResult: "1"
+          sql: |
+            SELECT count(*) FROM pg_namespace
+            WHERE nspname = 'scrapbook'
+              AND pg_get_userbyid(nspowner) = 'scrapbook_owner'
+              AND current_user = 'scrapbook_owner'
+              AND current_setting('server_version_num')::integer BETWEEN 180000 AND 189999
+      - or:
+          - and:
+              - not:
+                  - changeSetExecuted:
+                      id: f01-story-001-base
+                      author: scrapbook
+                      changeLogFile: changelogs/sprint-1/changelog.yaml
+              - sqlCheck:
+                  expectedResult: "0"
+                  sql: |
+                    SELECT
+                        (SELECT count(*) FROM pg_class AS c
+                         JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                         WHERE n.nspname = 'scrapbook' AND c.relname NOT IN
+                             ('databasechangelog', 'databasechangeloglock', 'databasechangeloglock_pkey', 'pk_databasechangeloglock'))
+                        +
+                        (SELECT count(*) FROM pg_proc AS p
+                         JOIN pg_namespace AS n ON n.oid = p.pronamespace
+                         WHERE n.nspname = 'scrapbook')
+          - and:
+              - changeSetExecuted:
+                  id: f01-story-001-base
+                  author: scrapbook
+                  changeLogFile: changelogs/sprint-1/changelog.yaml
+              - sqlCheck:
+                  expectedResult: "1"
+                  sql: |
+                    SELECT (obj_description('scrapbook.foundation_signature()'::regprocedure::oid, 'pg_proc')
+                        IS NOT DISTINCT FROM 'f01-baseline:' || scrapbook.foundation_signature())::integer
+  - include:
+      file: changelogs/sprint-1/changelog.yaml
+      relativeToChangelogFile: true
