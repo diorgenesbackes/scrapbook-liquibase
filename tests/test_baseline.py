@@ -232,21 +232,31 @@ databaseChangeLog:
     def test_reapply_rejects_control_grants_outside_matrix(self):
         role = "fixture_liquibase_reader"
         checked(self.psql(f"CREATE ROLE {role} NOLOGIN; GRANT USAGE ON SCHEMA scrapbook TO {role}"))
+        history_query = """
+            SELECT row_to_json(history)
+            FROM scrapbook.databasechangelog AS history ORDER BY orderexecuted;
+        """
         try:
             self.install()
+            self.assert_history(1)
+            original_history = checked(self.psql(history_query))
             for grant in (
                 "SELECT ON scrapbook.databasechangelog",
                 "UPDATE (locked) ON scrapbook.databasechangeloglock",
+                "SELECT (ctid) ON scrapbook.databasechangelog",
+                "SELECT (ctid) ON scrapbook.databasechangeloglock",
             ):
                 with self.subTest(grant=grant):
                     checked(self.psql(f"GRANT {grant} TO {role}"))
-                    checked(self.liquibase("update"),
-                            expected="Privilégios efetivos incompatíveis nos controles do Liquibase")
-                    checked(self.psql(f"REVOKE {grant} FROM {role}"))
+                    try:
+                        checked(self.liquibase("update"),
+                                expected="Privilégios efetivos incompatíveis nos controles do Liquibase")
+                    finally:
+                        checked(self.psql(f"REVOKE {grant} FROM {role}"))
                     self.assertEqual(TABLES, self.installed_tables())
-                    self.assert_history(1)
+                    self.assertEqual(original_history, checked(self.psql(history_query)))
             self.install()
-            self.assert_history(1)
+            self.assertEqual(original_history, checked(self.psql(history_query)))
         finally:
             checked(self.psql(f"DROP OWNED BY {role}; DROP ROLE {role}"))
 

@@ -52,7 +52,6 @@ BEGIN
                   FROM pg_attribute AS attribute
                   CROSS JOIN LATERAL aclexplode(attribute.attacl) AS privilege
                   WHERE attribute.attrelid = control.oid
-                    AND attribute.attnum > 0
                     AND NOT attribute.attisdropped
                     AND privilege.grantee <> owner_oid
               )
