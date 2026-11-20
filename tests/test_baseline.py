@@ -444,6 +444,22 @@ databaseChangeLog:
         self.install()
         self.assertEqual(TABLES, self.installed_tables())
 
+    def test_fargate_preflight_verifies_applied_generation(self):
+        self.install()
+        runtime = self.runtime_env
+        driver = Path(runtime["LIQUIBASE_HOME"]) / "internal/lib/postgresql.jar"
+        environment = runtime | {
+            "LIQUIBASE_COMMAND_PASSWORD": self.password,
+            "LIQUIBASE_COMMAND_URL": f"jdbc:postgresql://127.0.0.1:{self.port}/{self.database}",
+        }
+        command = [
+            str(Path(runtime["JAVA_HOME"]) / "bin/java"), "--class-path", str(driver),
+            "scripts/MigrationPreflight.java", "config/preflight.sql",
+        ]
+        generation = (ROOT / "config/catalog-generation.txt").read_text().strip()
+        checked(run([*command, generation], env=environment))
+        checked(run([*command, "geracao-divergente"], env=environment), expected="geração ativa difere")
+
     def test_rollback_refuses_populated_baseline_and_external_dependencies(self):
         self.install()
         checked(self.psql("INSERT INTO scrapbook.accounts(state) VALUES ('anonymized')", user=APP))
