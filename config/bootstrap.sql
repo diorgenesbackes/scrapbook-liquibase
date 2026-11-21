@@ -4,6 +4,10 @@ DECLARE
     login_required boolean;
     owner_oid oid;
     database_name text := current_database();
+    operator_name name := current_user;
+    operator_oid oid := current_user::regrole;
+    temporary_owner_access boolean;
+    operator_grant_exists boolean;
 BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('scrapbook.bootstrap'));
 
@@ -45,6 +49,19 @@ BEGIN
         RAISE EXCEPTION 'Associação de roles incompatível com a matriz Scrap Book.';
     END IF;
 
+    temporary_owner_access := NOT pg_has_role(operator_oid, owner_oid, 'SET');
+    IF temporary_owner_access THEN
+        SELECT EXISTS (
+            SELECT 1 FROM pg_auth_members
+            WHERE roleid = owner_oid AND member = operator_oid AND grantor = operator_oid
+        ) INTO operator_grant_exists;
+        IF operator_grant_exists THEN
+            GRANT scrapbook_owner TO CURRENT_USER WITH SET TRUE GRANTED BY CURRENT_USER;
+        ELSE
+            GRANT scrapbook_owner TO CURRENT_USER WITH INHERIT FALSE, SET TRUE GRANTED BY CURRENT_USER;
+        END IF;
+    END IF;
+
     IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'scrapbook') THEN
         CREATE SCHEMA scrapbook AUTHORIZATION scrapbook_owner;
     ELSIF NOT EXISTS (
@@ -54,6 +71,7 @@ BEGIN
     END IF;
 
     GRANT scrapbook_owner TO scrapbook_migrator WITH INHERIT FALSE, SET TRUE;
+    SET LOCAL ROLE scrapbook_owner;
     REVOKE ALL ON SCHEMA scrapbook FROM PUBLIC;
     GRANT USAGE ON SCHEMA scrapbook TO scrapbook_app, scrapbook_audit_reader;
     ALTER DEFAULT PRIVILEGES FOR ROLE scrapbook_owner REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
@@ -67,6 +85,15 @@ BEGIN
           AND privilege.grantee <> owner_oid
     ) THEN
         RAISE EXCEPTION 'Privilégios padrão incompatíveis com a matriz Scrap Book.';
+    END IF;
+
+    EXECUTE format('SET LOCAL ROLE %I', operator_name);
+    IF temporary_owner_access THEN
+        IF operator_grant_exists THEN
+            REVOKE SET OPTION FOR scrapbook_owner FROM CURRENT_USER GRANTED BY CURRENT_USER;
+        ELSE
+            REVOKE scrapbook_owner FROM CURRENT_USER GRANTED BY CURRENT_USER;
+        END IF;
     END IF;
 
     EXECUTE format('ALTER ROLE scrapbook_migrator IN DATABASE %I SET role = scrapbook_owner',
