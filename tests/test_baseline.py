@@ -21,6 +21,7 @@ notification_attempts outbox_messages processed_messages audit_entries
 """.split())
 MIGRATOR = "scrapbook_migrator"
 APP = "scrapbook_app"
+BOOTSTRAP_ADMIN = "bootstrap_admin"
 
 
 def run(args, *, cwd=ROOT, sql=None, env=None, timeout=120):
@@ -62,6 +63,10 @@ class BaselineTests(unittest.TestCase):
             raise RuntimeError(f"Publicação Docker inesperada: {port}")
         cls.port = port.rsplit(":", 1)[1]
         cls.counter = 0
+        checked(run(
+            ["docker", "exec", "-i", cls.container, "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U", "postgres"],
+            sql=f"CREATE ROLE {BOOTSTRAP_ADMIN} LOGIN NOSUPERUSER CREATEROLE CREATEDB PASSWORD '{cls.password}'",
+        ))
         cli_version = checked(run(["liquibase", "--version"]))
         if f'Liquibase Version: {VERSIONS["liquibase"]}' not in cli_version:
             raise RuntimeError(f'Usar Liquibase {VERSIONS["liquibase"]} no laboratório.')
@@ -74,14 +79,14 @@ class BaselineTests(unittest.TestCase):
     def setUp(self):
         type(self).counter += 1
         self.database = f"f01_case_{self.counter}"
-        checked(self.psql(f"CREATE DATABASE {self.database}", database="postgres"))
+        checked(self.psql(f"CREATE DATABASE {self.database} OWNER {BOOTSTRAP_ADMIN}", database="postgres"))
         bootstrap = (ROOT / "config/bootstrap.sql").read_text()
-        checked(self.psql(bootstrap))
+        checked(self.psql(bootstrap, user=BOOTSTRAP_ADMIN))
         checked(self.psql(
             f"ALTER ROLE {APP} PASSWORD '{self.password}'; "
             f"ALTER ROLE {MIGRATOR} PASSWORD '{self.password}'"
         ))
-        checked(self.psql(bootstrap))
+        checked(self.psql(bootstrap, user=BOOTSTRAP_ADMIN))
 
     def psql(self, sql, *, user="postgres", database=None):
         args = ["docker", "exec", "--interactive"]
@@ -189,6 +194,29 @@ databaseChangeLog:
         checked(self.liquibase("update"), expected="divergência no catálogo")
         self.assertEqual(set(), self.installed_tables())
         self.assertEqual(original_history, checked(self.psql(history_query)))
+
+    def test_bootstrap_preserves_existing_administrator_membership_options(self):
+        grant = "GRANT scrapbook_owner TO CURRENT_USER WITH INHERIT TRUE, SET FALSE GRANTED BY CURRENT_USER"
+        revoke = "REVOKE scrapbook_owner FROM CURRENT_USER GRANTED BY CURRENT_USER"
+        find_grant = """
+            SELECT admin_option, inherit_option, set_option
+            FROM pg_auth_members
+            WHERE roleid = 'scrapbook_owner'::regrole
+                AND member = 'bootstrap_admin'::regrole
+                AND grantor = 'bootstrap_admin'::regrole
+        """
+        self.assertEqual("", checked(self.psql(find_grant)))
+        checked(self.psql(grant, user=BOOTSTRAP_ADMIN))
+        try:
+            bootstrap = (ROOT / "config/bootstrap.sql").read_text()
+            checked(self.psql(bootstrap, user=BOOTSTRAP_ADMIN))
+            self.assertEqual("f|t|f", checked(self.psql(find_grant)))
+            self.assertEqual(
+                "f", checked(self.psql("SELECT pg_has_role(current_user, 'scrapbook_owner', 'SET')",
+                                      user=BOOTSTRAP_ADMIN))
+            )
+        finally:
+            checked(self.psql(revoke, user=BOOTSTRAP_ADMIN))
 
     def test_bootstrap_rejects_unexpected_role_membership(self):
         checked(self.psql("GRANT pg_read_all_data TO scrapbook_app WITH SET TRUE"))
