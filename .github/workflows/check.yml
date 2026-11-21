@@ -1,0 +1,30 @@
+name: Verificar Liquibase
+on:
+  pull_request:
+    branches: [dev, hlg, main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - name: Instalar Liquibase verificado
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/liquibase"
+          archive="$RUNNER_TEMP/liquibase-4.33.0.tar.gz"
+          curl --fail --silent --show-error --location --proto '=https' \
+            'https://github.com/liquibase/liquibase/releases/download/v4.33.0/liquibase-4.33.0.tar.gz' -o "$archive"
+          printf '%s  %s\n' '689acfcdc97bad0d4c150d1efab9c851e251b398cb3d6326f75e8aafe40ed578' "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP/liquibase"
+          echo "$RUNNER_TEMP/liquibase" >> "$GITHUB_PATH"
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "LIQUIBASE_HOME=$RUNNER_TEMP/liquibase" >> "$GITHUB_ENV"
+      - run: python3 tests/test_baseline.py
+      - run: docker build --platform linux/amd64 --tag scrapbook-liquibase-ci .
