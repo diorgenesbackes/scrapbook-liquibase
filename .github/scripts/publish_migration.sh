@@ -3,13 +3,14 @@ set -euo pipefail
 source .github/scripts/release_support.sh
 source .github/scripts/release_ecs.sh
 
-active_parameter=/scrapbook/hlg/liquibase/active
-pending_parameter=/scrapbook/hlg/liquibase/pending
+target=$(release_target)
+active_parameter="/scrapbook/$target/liquibase/active"
+pending_parameter="/scrapbook/$target/liquibase/pending"
 
 finalize_migration() {
     local pending="$1" task definition image statuses marker
-    task=$(jq -er --arg cluster "$ECS_CLUSTER" '
-        select(.cluster == $cluster and .environment == "hlg" and .result == "incomplete")
+    task=$(jq -er --arg cluster "$ECS_CLUSTER" --arg target "$target" '
+        select(.cluster == $cluster and .environment == $target and .result == "incomplete")
         | select(.generation | strings | test("^[a-z0-9][a-z0-9-]*\\z"))
         | select(.version | strings | test("^v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)\\z"))
         | select(.sha | strings | test("^[0-9a-f]{40}\\z"))
@@ -53,6 +54,11 @@ reconcile_pending_migration() {
 }
 
 : "${ECS_CLUSTER:?}" "${MIGRATION_TASK_DEFINITION:?}" "${MIGRATION_SUBNET_IDS:?}" "${MIGRATION_GROUP_ID:?}"
+if [[ "$target" == production ]]; then
+    [[ "${MIGRATION_PASSWORD_SECRET_ARN:?}" == "arn:aws:secretsmanager:us-east-1:$AWS_ACCOUNT_ID:secret:"?* ]]
+    tls_url='^jdbc:postgresql://[a-z0-9.-]+:5432/[a-zA-Z0-9_]+\?sslmode=verify-full&sslrootcert=/opt/scrapbook/certs/rds-us-east-1\.pem$'
+    [[ "${MIGRATION_DATABASE_URL:?}" =~ $tls_url ]]
+fi
 generation=$(cat config/catalog-generation.txt)
 [[ "$generation" =~ ^[a-z0-9][a-z0-9-]*$ ]]
 [[ "$MIGRATION_GROUP_ID" =~ ^sg-[a-f0-9]+$ ]]
@@ -64,11 +70,17 @@ network=$(jq -ecn --argjson subnets "$MIGRATION_SUBNET_IDS" --arg group "$MIGRAT
 ensure_current_revision
 reconcile_pending_migration
 aws ecs describe-task-definition --task-definition "$MIGRATION_TASK_DEFINITION" --output json |
-    jq -e '
+    jq -e --arg target "$target" --arg password "${MIGRATION_PASSWORD_SECRET_ARN:-}" \
+        --arg url "${MIGRATION_DATABASE_URL:-}" '
         .taskDefinition.containerDefinitions[] | select(.name == "liquibase") |
         ((.command // []) | length) == 0 and ((.entryPoint // []) | length) == 0 and
         (all(.environment[]; .name != "LIQUIBASE_COMMAND_PASSWORD")) and
         any(.secrets[]; .name == "LIQUIBASE_COMMAND_PASSWORD" and (.valueFrom | startswith("arn:aws:secretsmanager:"))) and
+        ($target != "production" or (
+            ([.secrets[] | select(.name == "LIQUIBASE_COMMAND_PASSWORD") | .valueFrom] == [$password]) and
+            all(.secrets[]; .name != "LIQUIBASE_COMMAND_URL") and ((.environmentFiles // []) | length) == 0 and
+            ([.environment[] | select(.name == "LIQUIBASE_COMMAND_URL") | .value] == [$url])
+        )) and
         .logConfiguration.logDriver == "awslogs"' >/dev/null
 image=$(build_immutable_image)
 record image "$image"
