@@ -43,6 +43,13 @@ def checked(result, expected=None):
 class BaselineTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        temporary = tempfile.TemporaryDirectory(prefix="scrapbook-baseline-")
+        cls.addClassCleanup(temporary.cleanup)
+        cls.baseline = Path(temporary.name)
+        master = (ROOT / "db.changelog-master.yaml").read_text()
+        includes = master.index("  - include:\n      file: changelogs/sprint-2/changelog.yaml")
+        (cls.baseline / "db.changelog-master.yaml").write_text(master[:includes])
+        (cls.baseline / "changelogs").symlink_to(ROOT / "changelogs", target_is_directory=True)
         suffix = secrets.token_hex(8)
         cls.container = "scrapbook-f01-" + suffix
         cls.password = secrets.token_hex(24)
@@ -98,9 +105,9 @@ class BaselineTests(unittest.TestCase):
             args += ["--host", "127.0.0.1"]
         return run(args, sql=sql, env={"PGPASSWORD": self.password})
 
-    def liquibase(self, command, *args, cwd=ROOT):
+    def liquibase(self, command, *args, cwd=None):
         return run(
-            [sys.executable, str(ROOT / "scripts/migrate.py"), command, *args], cwd=cwd,
+            [sys.executable, str(ROOT / "scripts/migrate.py"), command, *args], cwd=cwd or self.baseline,
             env=self.runtime_env | {"LIQUIBASE_COMMAND_PASSWORD": self.password,
                  "LIQUIBASE_COMMAND_URL": f"jdbc:postgresql://127.0.0.1:{self.port}/{self.database}"},
         )
@@ -348,7 +355,7 @@ databaseChangeLog:
         with tempfile.TemporaryDirectory(prefix="scrapbook-f01-failing-") as temp:
             work = Path(temp)
             shutil.copytree(ROOT / "changelogs", work / "changelogs")
-            original = (ROOT / "db.changelog-master.yaml").read_text()
+            original = (self.baseline / "db.changelog-master.yaml").read_text()
             (work / "db.changelog-master.yaml").write_text(original + """
   - changeSet:
       id: fixture-failure
@@ -366,7 +373,7 @@ databaseChangeLog:
 
     def prepare_evolution(self, work, *, incomplete=False):
         shutil.copytree(ROOT / "changelogs", work / "changelogs")
-        original = (ROOT / "db.changelog-master.yaml").read_text()
+        original = (self.baseline / "db.changelog-master.yaml").read_text()
         evolution = """
   - changeSet:
       id: fixture-schema-generation
@@ -473,7 +480,7 @@ databaseChangeLog:
         self.assertEqual(TABLES, self.installed_tables())
 
     def test_fargate_preflight_verifies_applied_generation(self):
-        self.install()
+        checked(self.liquibase("update", cwd=ROOT))
         runtime = self.runtime_env
         driver = Path(runtime["LIQUIBASE_HOME"]) / "internal/lib/postgresql.jar"
         environment = runtime | {
@@ -487,6 +494,48 @@ databaseChangeLog:
         generation = (ROOT / "config/catalog-generation.txt").read_text().strip()
         checked(run([*command, generation], env=environment))
         checked(run([*command, "geracao-divergente"], env=environment), expected="geração ativa difere")
+
+    def test_event_creation_extension_preserves_existing_events_and_rolls_back(self):
+        self.install()
+        signature = checked(self.psql("SELECT scrapbook.foundation_signature()"))
+        self.add_fixture_event()
+        for _ in range(2):
+            checked(self.liquibase("update", cwd=ROOT))
+            checked(self.liquibase("update", cwd=ROOT))
+            self.assert_history(2)
+            self.assertEqual("t", checked(self.psql(
+                "SELECT creation_key_hash IS NULL AND creation_payload_hash IS NULL FROM scrapbook.events")))
+            checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT))
+            self.assert_history(1)
+            self.assertEqual(signature, checked(self.psql("SELECT scrapbook.foundation_signature()")))
+            self.assertEqual("Evento sintético", checked(self.psql("SELECT name FROM scrapbook.events")))
+
+    def test_event_creation_extension_refuses_incomplete_hashes_and_populated_rollback(self):
+        checked(self.liquibase("update", cwd=ROOT))
+        self.add_fixture_event()
+        checked(self.psql("UPDATE scrapbook.events SET creation_key_hash = decode(repeat('ab', 32), 'hex')", user=APP),
+                expected="ck_events_creation_hashes")
+        checked(self.psql("""
+            UPDATE scrapbook.events
+            SET creation_key_hash = decode(repeat('ab', 32), 'hex'),
+                creation_payload_hash = decode(repeat('cd', 32), 'hex')
+        """, user=APP))
+        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT), expected="descartaria chaves")
+        self.assert_history(2)
+        self.assertEqual("32|32", checked(self.psql(
+            "SELECT octet_length(creation_key_hash), octet_length(creation_payload_hash) FROM scrapbook.events")))
+
+    def add_fixture_event(self):
+        checked(self.psql("""
+            WITH account AS (INSERT INTO scrapbook.accounts (state) VALUES ('anonymized') RETURNING id)
+            INSERT INTO scrapbook.events (
+                events_creator_accounts_id, code, name, starts_at, submission_opens_at, submission_closes_at,
+                completion_deadline_at, opening_mode, opens_at, access_state
+            )
+            SELECT id, repeat('a', 43), 'Evento sintético', '2032-02-29 19:00', '2032-02-29 17:00',
+                '2032-03-01 12:00', '2032-03-01 13:00', 'scheduled', '2033-02-28 00:00', 'flexible'
+            FROM account
+        """, user=APP))
 
     def test_rollback_refuses_populated_baseline_and_external_dependencies(self):
         self.install()
