@@ -1,13 +1,13 @@
-name: Publicar Liquibase em homologação
+name: Publicar Liquibase
 on:
   push:
-    branches: [hlg]
+    branches: [hlg, main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: publish-hlg
+  group: publish-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -33,7 +33,7 @@ jobs:
     needs: reserve
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    environment: hlg
+    environment: ${{ github.ref_name == 'main' && 'production' || 'hlg' }}
     permissions:
       contents: read
       id-token: write
@@ -48,6 +48,8 @@ jobs:
       ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
       MIGRATION_TASK_DEFINITION: ${{ vars.MIGRATION_TASK_DEFINITION }}
       MIGRATION_SUBNET_IDS: ${{ vars.MIGRATION_SUBNET_IDS }}
+      MIGRATION_PASSWORD_SECRET_ARN: ${{ vars.MIGRATION_PASSWORD_SECRET_ARN }}
+      MIGRATION_DATABASE_URL: ${{ vars.MIGRATION_DATABASE_URL }}
       MIGRATION_GROUP_ID: ${{ vars.MIGRATION_GROUP_ID }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
