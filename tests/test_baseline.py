@@ -50,6 +50,11 @@ class BaselineTests(unittest.TestCase):
         includes = master.index("  - include:\n      file: changelogs/sprint-2/changelog.yaml")
         (cls.baseline / "db.changelog-master.yaml").write_text(master[:includes])
         (cls.baseline / "changelogs").symlink_to(ROOT / "changelogs", target_is_directory=True)
+        cls.event_creation = cls.baseline / "event_creation"
+        cls.event_creation.mkdir()
+        photos = master.index("  - include:\n      file: changelogs/sprint-3/changelog.yaml")
+        (cls.event_creation / "db.changelog-master.yaml").write_text(master[:photos])
+        (cls.event_creation / "changelogs").symlink_to(ROOT / "changelogs", target_is_directory=True)
         suffix = secrets.token_hex(8)
         cls.container = "scrapbook-f01-" + suffix
         cls.password = secrets.token_hex(24)
@@ -500,18 +505,18 @@ databaseChangeLog:
         signature = checked(self.psql("SELECT scrapbook.foundation_signature()"))
         self.add_fixture_event()
         for _ in range(2):
-            checked(self.liquibase("update", cwd=ROOT))
-            checked(self.liquibase("update", cwd=ROOT))
+            checked(self.liquibase("update", cwd=self.event_creation))
+            checked(self.liquibase("update", cwd=self.event_creation))
             self.assert_history(2)
             self.assertEqual("t", checked(self.psql(
                 "SELECT creation_key_hash IS NULL AND creation_payload_hash IS NULL FROM scrapbook.events")))
-            checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT))
+            checked(self.liquibase("rollback-count", "--count=1", cwd=self.event_creation))
             self.assert_history(1)
             self.assertEqual(signature, checked(self.psql("SELECT scrapbook.foundation_signature()")))
             self.assertEqual("Evento sintético", checked(self.psql("SELECT name FROM scrapbook.events")))
 
     def test_event_creation_extension_refuses_incomplete_hashes_and_populated_rollback(self):
-        checked(self.liquibase("update", cwd=ROOT))
+        checked(self.liquibase("update", cwd=self.event_creation))
         self.add_fixture_event()
         checked(self.psql("UPDATE scrapbook.events SET creation_key_hash = decode(repeat('ab', 32), 'hex')", user=APP),
                 expected="ck_events_creation_hashes")
@@ -520,10 +525,113 @@ databaseChangeLog:
             SET creation_key_hash = decode(repeat('ab', 32), 'hex'),
                 creation_payload_hash = decode(repeat('cd', 32), 'hex')
         """, user=APP))
-        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT), expected="descartaria chaves")
+        checked(self.liquibase("rollback-count", "--count=1", cwd=self.event_creation), expected="descartaria chaves")
         self.assert_history(2)
         self.assertEqual("32|32", checked(self.psql(
             "SELECT octet_length(creation_key_hash), octet_length(creation_payload_hash) FROM scrapbook.events")))
+
+    def test_photo_receipts_upgrade_and_empty_rollback_preserve_prior_rows(self):
+        checked(self.liquibase("update", cwd=self.event_creation))
+        prior_signature = checked(self.psql("SELECT scrapbook.foundation_signature()"))
+        self.add_photo_fixture()
+        for _ in range(2):
+            checked(self.liquibase("update", cwd=ROOT))
+            checked(self.liquibase("update", cwd=ROOT))
+            self.assert_history(3)
+            self.assertEqual("2|0", checked(self.psql("""
+                SELECT count(*), count(receipt_event_at) FROM scrapbook.storage_objects
+            """, user=APP)))
+            self.assertEqual("0", checked(self.psql("SELECT count(*) FROM scrapbook.photo_upload_receipts", user=APP)))
+            checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT))
+            self.assert_history(2)
+            self.assertEqual(prior_signature, checked(self.psql("SELECT scrapbook.foundation_signature()")))
+            self.assertEqual("2", checked(self.psql("SELECT count(*) FROM scrapbook.storage_objects", user=APP)))
+
+    def test_photo_receipts_require_version_and_protect_populated_rollback(self):
+        checked(self.liquibase("update", cwd=ROOT))
+        self.add_photo_fixture()
+        proof = "receipt_event_at = '2032-03-01T16:00:00.123456Z', receipt_event_kind = 'put'"
+        update = "UPDATE scrapbook.storage_objects SET "
+        checked(self.psql(update + "receipt_event_kind = 'put'", user=APP),
+                expected="ck_storage_objects_receipt_event")
+        checked(self.psql(update + proof, user=APP), expected="ck_storage_objects_receipt_event")
+        checked(self.psql(update + proof + ", version_id = 'null', observed_at = CURRENT_TIMESTAMP", user=APP),
+                expected="ck_storage_objects_receipt_event")
+        set_proof = update + proof + ", version_id = 'fixture-version', observed_at = CURRENT_TIMESTAMP"
+        checked(self.psql(set_proof + " WHERE kind = 'original'", user=APP), expected="ck_storage_objects_receipt_event")
+        checked(self.psql(set_proof + " WHERE kind = 'temporary'", user=APP))
+        self.assertEqual("t", checked(self.psql("""
+            SELECT receipt_event_at = '2032-03-01T16:00:00.123456Z' AND receipt_event_kind = 'put'
+            FROM scrapbook.storage_objects WHERE kind = 'temporary'
+        """, user=APP)))
+        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT), expected="descartaria evidências")
+        self.assert_history(3)
+
+    def test_photo_receipt_history_grants_exact_version_cleanup(self):
+        checked(self.liquibase("update", cwd=ROOT))
+        self.add_photo_fixture()
+        insert = """
+            INSERT INTO scrapbook.photo_upload_receipts (storage_object_id, version_id, received_at, size, cleanup_after)
+            SELECT id, '{version}', '2032-03-01T16:00:00Z', 13, '2032-03-02T16:00:00Z'
+            FROM scrapbook.storage_objects WHERE kind = 'temporary'
+            RETURNING id, event_kind;
+        """
+        self.assertEqual("1|put", checked(self.psql(insert.format(version="fixture-v1"), user=APP)))
+        checked(self.psql(insert.format(version="fixture-v1"), user=APP), expected="uq_photo_upload_receipts_version")
+        checked(self.psql(insert.format(version="fixture-v2"), user=APP))
+        checked(self.psql("""
+            UPDATE scrapbook.photo_upload_receipts SET deleted_at = CURRENT_TIMESTAMP WHERE version_id = 'fixture-v1'
+        """, user=APP))
+        self.assertEqual("2|1", checked(self.psql("""
+            SELECT count(*), count(deleted_at) FROM scrapbook.photo_upload_receipts
+        """, user=APP)))
+        for forbidden in ("UPDATE scrapbook.photo_upload_receipts SET size = 5",
+                          "DELETE FROM scrapbook.photo_upload_receipts",
+                          "ALTER TABLE scrapbook.photo_upload_receipts ADD COLUMN fixture text"):
+            checked(self.psql(forbidden, user=APP), expected="photo_upload_receipts")
+        self.assertEqual("f", checked(self.psql("""
+            SELECT has_sequence_privilege('scrapbook_app', 'scrapbook.photo_upload_receipts_id_seq', 'USAGE')
+        """)))
+        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT), expected="descartaria evidências")
+        self.assert_history(3)
+
+    def test_photo_receipt_schema_drift_blocks_rollback(self):
+        checked(self.liquibase("update", cwd=ROOT))
+        checked(self.psql("ALTER TABLE scrapbook.photo_upload_receipts ADD COLUMN fixture_unexpected text"))
+        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT), expected="divergência no catálogo")
+        self.assert_history(3)
+        self.assertIn("photo_upload_receipts", self.installed_tables())
+
+    def add_photo_fixture(self):
+        self.add_fixture_event()
+        checked(self.psql("""
+            WITH notice AS (
+                INSERT INTO scrapbook.consent_notices (code, body, body_hash, effective_at)
+                VALUES ('fixture', 'Aviso sintético', decode(repeat('ab', 32), 'hex'), CURRENT_TIMESTAMP)
+                RETURNING id
+            ), record AS (
+                INSERT INTO scrapbook.records (
+                    records_events_id, records_consent_notices_id, category, format, sender_name,
+                    expected_file_count, consented_at, submitted_at, state
+                )
+                SELECT events.id, notice.id, 'testimonial', 'photo', 'Visitante sintético',
+                    1, '2032-03-01 11:55:00', '2032-03-01 11:55:00', 'receiving'
+                FROM scrapbook.events CROSS JOIN notice
+                RETURNING id
+            ), file AS (
+                INSERT INTO scrapbook.files (
+                    files_records_id, position, client_key, kind, declared_type, declared_size,
+                    validation_state, processing_state
+                )
+                SELECT id, 1, gen_random_uuid(), 'photo', 'image/jpeg', 13, 'expected', 'not_requested'
+                FROM record
+                RETURNING id
+            )
+            INSERT INTO scrapbook.storage_objects (storage_objects_files_id, kind, state, bucket, object_key)
+            SELECT file.id, objects.kind, 'planned', 'scrapbook-fixture', objects.key
+            FROM file CROSS JOIN (VALUES ('temporary', 'temporary/fixture'), ('original', 'original/fixture'))
+                AS objects (kind, key)
+        """, user=APP))
 
     def add_fixture_event(self):
         checked(self.psql("""
