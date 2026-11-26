@@ -535,8 +535,7 @@ databaseChangeLog:
         prior_signature = checked(self.psql("SELECT scrapbook.foundation_signature()"))
         self.add_photo_fixture()
         for _ in range(2):
-            checked(self.liquibase("update", cwd=ROOT))
-            checked(self.liquibase("update", cwd=ROOT))
+            self.install_photo_receipts()
             self.assert_history(3)
             self.assertEqual("2|0", checked(self.psql("""
                 SELECT count(*), count(receipt_event_at) FROM scrapbook.storage_objects
@@ -548,7 +547,7 @@ databaseChangeLog:
             self.assertEqual("2", checked(self.psql("SELECT count(*) FROM scrapbook.storage_objects", user=APP)))
 
     def test_photo_receipts_require_version_and_protect_populated_rollback(self):
-        checked(self.liquibase("update", cwd=ROOT))
+        self.install_photo_receipts()
         self.add_photo_fixture()
         proof = "receipt_event_at = '2032-03-01T16:00:00.123456Z', receipt_event_kind = 'put'"
         update = "UPDATE scrapbook.storage_objects SET "
@@ -568,7 +567,7 @@ databaseChangeLog:
         self.assert_history(3)
 
     def test_photo_receipt_history_grants_exact_version_cleanup(self):
-        checked(self.liquibase("update", cwd=ROOT))
+        self.install_photo_receipts()
         self.add_photo_fixture()
         insert = """
             INSERT INTO scrapbook.photo_upload_receipts (storage_object_id, version_id, received_at, size, cleanup_after)
@@ -596,11 +595,72 @@ databaseChangeLog:
         self.assert_history(3)
 
     def test_photo_receipt_schema_drift_blocks_rollback(self):
-        checked(self.liquibase("update", cwd=ROOT))
+        self.install_photo_receipts()
         checked(self.psql("ALTER TABLE scrapbook.photo_upload_receipts ADD COLUMN fixture_unexpected text"))
         checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT), expected="divergência no catálogo")
         self.assert_history(3)
         self.assertIn("photo_upload_receipts", self.installed_tables())
+
+    def install_photo_receipts(self):
+        checked(self.liquibase("update", cwd=ROOT))
+        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT))
+
+    def test_video_multipart_empty_rollback_keeps_photo_receipt(self):
+        self.install_photo_receipts()
+        signature = checked(self.psql("SELECT scrapbook.foundation_signature()"))
+        self.add_photo_fixture()
+        checked(self.add_media_receipt("put"))
+        for _ in range(2):
+            checked(self.liquibase("update", cwd=ROOT))
+            checked(self.liquibase("update", cwd=ROOT))
+            self.assert_history(4)
+            self.assertEqual("1", checked(self.psql(
+                "SELECT count(*) FROM scrapbook.files WHERE multipart_checksums IS NULL", user=APP,
+            )))
+            checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT))
+            self.assert_history(3)
+            self.assertEqual(signature, checked(self.psql("SELECT scrapbook.foundation_signature()")))
+            self.assertEqual("put", checked(self.psql(
+                "SELECT event_kind FROM scrapbook.photo_upload_receipts", user=APP,
+            )))
+
+    def test_video_multipart_checksums_require_a_supported_manifest_shape(self):
+        checked(self.liquibase("update", cwd=ROOT))
+        self.add_photo_fixture()
+        digest = "decode(repeat('ab', 32), 'hex')"
+        set_checksums = "UPDATE scrapbook.files SET multipart_checksums = "
+        checked(self.psql(set_checksums + f"ARRAY[{digest}, {digest}]", user=APP),
+                expected="ck_files_multipart_checksums")
+        checked(self.psql("UPDATE scrapbook.files SET kind = 'video', declared_size = 33554432", user=APP))
+        for malformed in ("ARRAY[]::bytea[]", f"ARRAY[{digest}]", f"ARRAY[{digest}, NULL::bytea]",
+                          f"ARRAY[[{digest}, {digest}]]", f"array_fill({digest}, ARRAY[31])"):
+            checked(self.psql(set_checksums + malformed, user=APP), expected="ck_files_multipart_checksums")
+        checked(self.psql(set_checksums + f"ARRAY[{digest}, {digest}]", user=APP))
+        self.assertEqual("2", checked(self.psql(
+            "SELECT cardinality(multipart_checksums) FROM scrapbook.files", user=APP,
+        )))
+        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT), expected="descartaria dados")
+        self.assert_history(4)
+
+    def test_video_multipart_receipt_is_preserved_on_blocked_rollback(self):
+        checked(self.liquibase("update", cwd=ROOT))
+        self.add_photo_fixture()
+        checked(self.add_media_receipt("unsupported"), expected="ck_photo_upload_receipts_kind")
+        checked(self.add_media_receipt("complete_multipart"))
+        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT), expected="descartaria dados")
+        self.assert_history(4)
+        self.assertEqual("complete_multipart", checked(self.psql(
+            "SELECT event_kind FROM scrapbook.photo_upload_receipts", user=APP,
+        )))
+
+    def add_media_receipt(self, event_kind):
+        return self.psql(f"""
+            INSERT INTO scrapbook.photo_upload_receipts (
+                storage_object_id, version_id, received_at, event_kind, size, cleanup_after
+            )
+            SELECT id, 'fixture-v1', '2032-03-01T16:00:00Z', '{event_kind}', 13, '2032-03-02T16:00:00Z'
+            FROM scrapbook.storage_objects WHERE kind = 'temporary'
+        """, user=APP)
 
     def add_photo_fixture(self):
         self.add_fixture_event()
