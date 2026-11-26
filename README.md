@@ -8,7 +8,7 @@ O changelog inicial da F01 instala as 24 tabelas de aplicação no schema `scrap
 - `scrapbook_owner` é a proprietária sem login. `scrapbook_migrator` autentica separadamente e assume a proprietária no banco provisionado. As tabelas de controle usam o schema `scrapbook`.
 - `scrapbook_app` tem USAGE no schema, leitura e inserção nas tabelas de aplicação comuns e UPDATE nas tabelas mutáveis. A auditoria permite somente INSERT à aplicação. A leitura de auditoria usa a role separada `scrapbook_audit_reader`. A sessão de migração acessa os controles como proprietária. A pré-validação recusa grants de tabela ou coluna nesses controles para outros beneficiários, inclusive PUBLIC.
 - [scripts/migrate.py](scripts/migrate.py) verifica o alvo, os defaults e os controles preexistentes por JDBC antes de iniciar a CLI. A pré-validação usa uma conexão somente leitura e o JDK e driver PostgreSQL da instalação do Liquibase. Se a detecção por `liquibase --version` não informar os caminhos, forneça `JAVA_HOME` e `LIQUIBASE_HOME`.
-- [db.changelog-master.yaml](db.changelog-master.yaml) inclui uma migração transacional. Os arquivos SQL criam tabelas e índices, adicionam as FKs depois das chaves candidatas, aplicam privilégios e registram uma assinatura do catálogo.
+- [db.changelog-master.yaml](db.changelog-master.yaml) inclui migrações transacionais em ordem de dependência. Os arquivos SQL criam tabelas e índices, adicionam as FKs depois das chaves candidatas, aplicam privilégios e registram uma assinatura do catálogo.
 
 ## Aplicar em laboratório
 
@@ -29,6 +29,10 @@ A instalação inicial exige histórico vazio nos controles do Liquibase e ausê
 Cada changeset que altera o catálogo deve terminar com `SELECT scrapbook.checkpoint_catalog('id-anterior', 'id-do-changeset')` na mesma transação do DDL. Use IDs de geração únicos e registrados pelo autor `scrapbook`. A função preserva a assinatura original de cada geração e confere os privilégios efetivos de runtime. O `update` valida o catálogo efetivo contra a assinatura da geração ativa e verifica se ela consta no histórico.
 
 No rollback de uma evolução, confira primeiro se a geração e a assinatura correspondem ao changeset que será revertido. Desfaça o DDL e chame `scrapbook.checkpoint_catalog('id-do-changeset', 'id-anterior', TRUE)` na mesma transação. A chamada exige a assinatura histórica da geração de destino e recusa uma reversão incompleta. A assinatura cobre a persistência das relações e os parâmetros de definição das sequências `IDENTITY`, como incremento e limites. O avanço normal da sequência na inserção é independente dessa comparação.
+
+### Prova de recepção de fotos
+
+A geração [f08-story-002-photo-receipts](changelogs/sprint-3/changelog.yaml) acrescenta a correlação de ingresso opcional na sessão, o instante e o tipo da prova na versão temporária fixada e o histórico das versões recebidas para limpeza. Campos novos nas tabelas existentes começam nulos. A role da aplicação pode registrar, consultar e marcar a exclusão de uma versão no histórico. O rollback restaura a geração anterior se o catálogo corresponder e se não houver evidências ou correlações de fotos registradas.
 
 ## Reverter no laboratório
 
