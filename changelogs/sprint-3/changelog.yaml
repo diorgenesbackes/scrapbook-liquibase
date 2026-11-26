@@ -16,3 +16,20 @@ databaseChangeLog:
             relativeToChangelogFile: true
             encoding: UTF-8
             splitStatements: false
+  - changeSet:
+      id: f08-story-004-video-multipart
+      author: scrapbook
+      dbms: postgresql
+      runInTransaction: true
+      changes:
+        - sqlFile:
+            path: sql/002-video-multipart.sql
+            relativeToChangelogFile: true
+            encoding: UTF-8
+            splitStatements: true
+      rollback:
+        - sqlFile:
+            path: rollback/002-video-multipart.sql
+            relativeToChangelogFile: true
+            encoding: UTF-8
+            splitStatements: false
