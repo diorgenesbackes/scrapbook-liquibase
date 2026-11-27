@@ -34,6 +34,10 @@ No rollback de uma evolução, confira primeiro se a geração e a assinatura co
 
 A geração [f08-story-002-photo-receipts](changelogs/sprint-3/changelog.yaml) acrescenta a correlação de ingresso opcional na sessão, o instante e o tipo da prova na versão temporária fixada e o histórico das versões recebidas para limpeza. Campos novos nas tabelas existentes começam nulos. A role da aplicação pode registrar, consultar e marcar a exclusão de uma versão no histórico. O rollback restaura a geração anterior se o catálogo corresponder e se não houver evidências ou correlações de fotos registradas.
 
+### Contexto da preparação de mídias
+
+A geração [f10-story-001-media-preparation](changelogs/sprint-4/changelog.yaml) acrescenta o contexto de confirmação, o ciclo de recuperação e o instante de submissão ao provedor. O esquema aceita linhas existentes sem o contexto de confirmação. A reversão restaura a geração F08 quando os campos novos ainda não contêm evidências. Para uma instalação em operação, pausar a preparação e manter a evolução de schema ao reverter o binário.
+
 ## Reverter no laboratório
 
 Com o estado inicial como único changeset aplicado, a suíte usa `python3 scripts/migrate.py rollback-count --count=1` para exercitar a própria reversão. Conferir histórico e alvo antes de qualquer execução manual. O rollback bloqueia as tabelas durante a verificação, exige a assinatura esperada e recusa dados, objetos estranhos e dependências externas. O schema preparado, suas roles e as tabelas de controle permanecem após a reversão. Para homologação e produção, seguir o workflow manual de recuperação quando ele estiver disponível.

@@ -55,6 +55,11 @@ class BaselineTests(unittest.TestCase):
         photos = master.index("  - include:\n      file: changelogs/sprint-3/changelog.yaml")
         (cls.event_creation / "db.changelog-master.yaml").write_text(master[:photos])
         (cls.event_creation / "changelogs").symlink_to(ROOT / "changelogs", target_is_directory=True)
+        cls.video_multipart = cls.baseline / "video_multipart"
+        cls.video_multipart.mkdir()
+        media = master.index("  - include:\n      file: changelogs/sprint-4/changelog.yaml")
+        (cls.video_multipart / "db.changelog-master.yaml").write_text(master[:media])
+        (cls.video_multipart / "changelogs").symlink_to(ROOT / "changelogs", target_is_directory=True)
         suffix = secrets.token_hex(8)
         cls.container = "scrapbook-f01-" + suffix
         cls.password = secrets.token_hex(24)
@@ -541,7 +546,7 @@ databaseChangeLog:
                 SELECT count(*), count(receipt_event_at) FROM scrapbook.storage_objects
             """, user=APP)))
             self.assertEqual("0", checked(self.psql("SELECT count(*) FROM scrapbook.photo_upload_receipts", user=APP)))
-            checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT))
+            checked(self.liquibase("rollback-count", "--count=1", cwd=self.video_multipart))
             self.assert_history(2)
             self.assertEqual(prior_signature, checked(self.psql("SELECT scrapbook.foundation_signature()")))
             self.assertEqual("2", checked(self.psql("SELECT count(*) FROM scrapbook.storage_objects", user=APP)))
@@ -563,7 +568,7 @@ databaseChangeLog:
             SELECT receipt_event_at = '2032-03-01T16:00:00.123456Z' AND receipt_event_kind = 'put'
             FROM scrapbook.storage_objects WHERE kind = 'temporary'
         """, user=APP)))
-        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT), expected="descartaria evidências")
+        checked(self.liquibase("rollback-count", "--count=1", cwd=self.video_multipart), expected="descartaria evidências")
         self.assert_history(3)
 
     def test_photo_receipt_history_grants_exact_version_cleanup(self):
@@ -591,19 +596,19 @@ databaseChangeLog:
         self.assertEqual("f", checked(self.psql("""
             SELECT has_sequence_privilege('scrapbook_app', 'scrapbook.photo_upload_receipts_id_seq', 'USAGE')
         """)))
-        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT), expected="descartaria evidências")
+        checked(self.liquibase("rollback-count", "--count=1", cwd=self.video_multipart), expected="descartaria evidências")
         self.assert_history(3)
 
     def test_photo_receipt_schema_drift_blocks_rollback(self):
         self.install_photo_receipts()
         checked(self.psql("ALTER TABLE scrapbook.photo_upload_receipts ADD COLUMN fixture_unexpected text"))
-        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT), expected="divergência no catálogo")
+        checked(self.liquibase("rollback-count", "--count=1", cwd=self.video_multipart), expected="divergência no catálogo")
         self.assert_history(3)
         self.assertIn("photo_upload_receipts", self.installed_tables())
 
     def install_photo_receipts(self):
-        checked(self.liquibase("update", cwd=ROOT))
-        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT))
+        checked(self.liquibase("update", cwd=self.video_multipart))
+        checked(self.liquibase("rollback-count", "--count=1", cwd=self.video_multipart))
 
     def test_video_multipart_empty_rollback_keeps_photo_receipt(self):
         self.install_photo_receipts()
@@ -611,13 +616,13 @@ databaseChangeLog:
         self.add_photo_fixture()
         checked(self.add_media_receipt("put"))
         for _ in range(2):
-            checked(self.liquibase("update", cwd=ROOT))
-            checked(self.liquibase("update", cwd=ROOT))
+            checked(self.liquibase("update", cwd=self.video_multipart))
+            checked(self.liquibase("update", cwd=self.video_multipart))
             self.assert_history(4)
             self.assertEqual("1", checked(self.psql(
                 "SELECT count(*) FROM scrapbook.files WHERE multipart_checksums IS NULL", user=APP,
             )))
-            checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT))
+            checked(self.liquibase("rollback-count", "--count=1", cwd=self.video_multipart))
             self.assert_history(3)
             self.assertEqual(signature, checked(self.psql("SELECT scrapbook.foundation_signature()")))
             self.assertEqual("put", checked(self.psql(
@@ -625,7 +630,7 @@ databaseChangeLog:
             )))
 
     def test_video_multipart_checksums_require_a_supported_manifest_shape(self):
-        checked(self.liquibase("update", cwd=ROOT))
+        checked(self.liquibase("update", cwd=self.video_multipart))
         self.add_photo_fixture()
         digest = "decode(repeat('ab', 32), 'hex')"
         set_checksums = "UPDATE scrapbook.files SET multipart_checksums = "
@@ -639,19 +644,87 @@ databaseChangeLog:
         self.assertEqual("2", checked(self.psql(
             "SELECT cardinality(multipart_checksums) FROM scrapbook.files", user=APP,
         )))
-        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT), expected="descartaria dados")
+        checked(self.liquibase("rollback-count", "--count=1", cwd=self.video_multipart), expected="descartaria dados")
         self.assert_history(4)
 
     def test_video_multipart_receipt_is_preserved_on_blocked_rollback(self):
-        checked(self.liquibase("update", cwd=ROOT))
+        checked(self.liquibase("update", cwd=self.video_multipart))
         self.add_photo_fixture()
         checked(self.add_media_receipt("unsupported"), expected="ck_photo_upload_receipts_kind")
         checked(self.add_media_receipt("complete_multipart"))
-        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT), expected="descartaria dados")
+        checked(self.liquibase("rollback-count", "--count=1", cwd=self.video_multipart), expected="descartaria dados")
         self.assert_history(4)
         self.assertEqual("complete_multipart", checked(self.psql(
             "SELECT event_kind FROM scrapbook.photo_upload_receipts", user=APP,
         )))
+
+    def add_processing_job_fixture(self):
+        checked(self.psql("""
+            INSERT INTO scrapbook.processing_jobs (
+                processing_jobs_files_id, kind, profile_version, profile, state, next_attempt_at
+            )
+            SELECT id, 'photo_prepare', 1, '{}', 'pending', CURRENT_TIMESTAMP
+            FROM scrapbook.files
+        """, user=APP))
+
+    def test_media_preparation_upgrade_reapply_and_rollback_preserve_f08_data(self):
+        checked(self.liquibase("update", cwd=self.video_multipart))
+        prior_signature = checked(self.psql("SELECT scrapbook.foundation_signature()"))
+        self.add_photo_fixture()
+        checked(self.add_media_receipt("put"))
+        self.add_processing_job_fixture()
+        for _ in range(2):
+            checked(self.liquibase("update", cwd=ROOT))
+            checked(self.liquibase("update", cwd=ROOT))
+            self.assert_history(5)
+            self.assertEqual("0|1", checked(self.psql("""
+                SELECT num_nonnulls(confirmation_message_id, confirmation_correlation_id, confirmed_at), retry_cycle
+                FROM scrapbook.processing_jobs
+            """, user=APP)))
+            checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT))
+            self.assert_history(4)
+            self.assertEqual(prior_signature, checked(self.psql("SELECT scrapbook.foundation_signature()")))
+            self.assertEqual("1", checked(self.psql("SELECT count(*) FROM scrapbook.processing_jobs", user=APP)))
+            self.assertEqual("1", checked(self.psql("SELECT count(*) FROM scrapbook.photo_upload_receipts", user=APP)))
+
+    def test_media_preparation_protects_confirmation_and_provider_submit_evidence(self):
+        checked(self.liquibase("update", cwd=ROOT))
+        self.add_photo_fixture()
+        self.add_processing_job_fixture()
+        checked(self.psql("""
+            UPDATE scrapbook.processing_jobs SET confirmed_at = CURRENT_TIMESTAMP
+        """, user=APP), expected="ck_processing_jobs_confirmation")
+        checked(self.psql("""
+            UPDATE scrapbook.processing_jobs SET retry_cycle = 0
+        """, user=APP), expected="ck_processing_jobs_confirmation")
+        insert_attempt = """
+            INSERT INTO scrapbook.processing_attempts (
+                processing_attempts_processing_jobs_id, processing_attempts_files_id,
+                number, request_key, provider, output_prefix, state, started_at, provider_submit_started_at
+            )
+            SELECT id, processing_jobs_files_id, 1, gen_random_uuid(), '{provider}',
+                'submissions/derived/fixture/', 'created',
+                '2032-03-01T16:00:00Z', '{submitted}'
+            FROM scrapbook.processing_jobs
+        """
+        for provider, submitted in (("local", "2032-03-01T16:00:01Z"), ("mediaconvert", "2032-03-01T15:59:59Z")):
+            checked(self.psql(insert_attempt.format(provider=provider, submitted=submitted), user=APP),
+                    expected="ck_processing_attempts_provider_submit_started_at")
+        checked(self.psql(insert_attempt.format(provider="mediaconvert", submitted="2032-03-01T16:00:01Z"), user=APP))
+        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT), expected="descartaria evidências")
+        checked(self.psql("UPDATE scrapbook.processing_attempts SET provider_submit_started_at = NULL", user=APP))
+        checked(self.psql("""
+            UPDATE scrapbook.processing_jobs SET confirmation_message_id = gen_random_uuid(),
+                confirmation_correlation_id = gen_random_uuid(), confirmed_at = '2032-03-01T16:00:00.123456Z'
+        """, user=APP))
+        checked(self.liquibase("rollback-count", "--count=1", cwd=ROOT), expected="descartaria evidências")
+        self.assertEqual("t", checked(self.psql("""
+            SELECT confirmed_at = '2032-03-01T16:00:00.123456Z' AND confirmation_message_id IS NOT NULL
+            FROM scrapbook.processing_jobs
+        """, user=APP)))
+        checked(self.psql("ALTER TABLE scrapbook.processing_jobs DROP COLUMN confirmed_at", user=APP),
+                expected="must be owner of table processing_jobs")
+        self.assert_history(5)
 
     def add_media_receipt(self, event_kind):
         return self.psql(f"""
